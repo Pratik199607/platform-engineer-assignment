@@ -1,3 +1,15 @@
+# Terraform
+.terraform/
+*.tfstate
+*.tfstate.*
+*.tfplan
+terraform.tfvars
+crash.log
+crash.*.log
+
+# Terraform lock file should be committed
+# .terraform.lock.hcl is intentionally NOT ignored
+
 # Python
 
 __pycache__/
@@ -48,6 +60,12 @@ Thumbs.db
 dist/
 build/
 *.egg-info/
+
+# Certificates/private keys
+*.key
+*.pem
+*.crt
+alb-openssl.cnf
 
 
 # Local databases

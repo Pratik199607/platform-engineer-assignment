@@ -1,0 +1,411 @@
+#!/bin/bash
+
+set -euxo pipefail
+
+exec > >(tee -a /var/log/platform-bootstrap.log | logger -t platform-bootstrap -s 2>/dev/console) 2>&1
+
+echo "===== Platform EC2 bootstrap started ====="
+
+# ============================================================
+# OS PACKAGE INSTALLATION
+# ============================================================
+
+echo "===== Updating operating system ====="
+
+dnf update -y
+
+echo "===== Installing required packages ====="
+
+dnf install -y \
+  python3.11 \
+  python3.11-pip \
+  git \
+  nginx \
+  rsync \
+  postgresql16 \
+  jq \
+  tar \
+  gzip \
+  unzip \
+  wget \
+  openssl
+
+# Amazon Linux 2023 provides curl-minimal.
+# Do not install the conflicting curl package.
+echo "===== Verifying required commands ====="
+
+command -v python3.11
+command -v pip3.11
+command -v git
+command -v nginx
+command -v rsync
+command -v psql
+command -v jq
+command -v curl
+command -v openssl
+
+# ============================================================
+# AWS CLI
+# ============================================================
+
+echo "===== Installing AWS CLI ====="
+
+if ! command -v aws >/dev/null 2>&1; then
+
+    curl "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" \
+      -o /tmp/awscliv2.zip
+
+    unzip -q /tmp/awscliv2.zip -d /tmp
+
+    /tmp/aws/install
+
+    rm -rf /tmp/aws /tmp/awscliv2.zip
+
+fi
+
+aws --version
+
+# ============================================================
+# APPLICATION USER
+# ============================================================
+
+echo "===== Creating application user ====="
+
+if ! id platform >/dev/null 2>&1; then
+
+    useradd \
+      --system \
+      --home-dir /opt/platform \
+      --shell /sbin/nologin \
+      platform
+
+fi
+
+# ============================================================
+# APPLICATION DIRECTORIES
+# ============================================================
+
+echo "===== Creating application directories ====="
+
+mkdir -p /opt/platform/releases
+mkdir -p /opt/platform/shared
+mkdir -p /opt/platform/logs
+mkdir -p /opt/platform/bin
+mkdir -p /opt/platform/config
+mkdir -p /opt/platform/shared/venvs
+
+chown -R platform:platform /opt/platform
+
+chmod 755 /opt/platform
+chmod 750 /opt/platform/releases
+chmod 750 /opt/platform/shared
+chmod 750 /opt/platform/logs
+chmod 750 /opt/platform/bin
+chmod 750 /opt/platform/config
+chmod 750 /opt/platform/shared/venvs
+
+# ============================================================
+# APPLICATION CONFIGURATION
+# ============================================================
+
+echo "===== Creating application configuration ====="
+
+mkdir -p /etc/platform
+
+cat > /etc/platform/platform.env <<'EOF'
+APP_ENV=poc
+LOG_LEVEL=INFO
+APP_HOST=127.0.0.1
+APP_PORT=8000
+DB_SECRET_ARN=${database_secret_arn}
+EOF
+
+chown root:platform /etc/platform/platform.env
+chmod 640 /etc/platform/platform.env
+
+# ============================================================
+# NGINX CONFIGURATION
+# ============================================================
+
+echo "===== Configuring Nginx ====="
+
+# Remove packaged/default application configuration.
+rm -f /etc/nginx/conf.d/default.conf
+
+# Replace the Amazon Linux default nginx.conf with a clean,
+# Terraform-managed configuration.
+#
+# This removes the default server_name "_" block that otherwise
+# conflicts with our application server in conf.d/platform.conf.
+
+cat > /etc/nginx/nginx.conf <<'EOF'
+user nginx;
+
+worker_processes auto;
+
+error_log /var/log/nginx/error.log notice;
+
+pid /run/nginx.pid;
+
+# Load dynamic modules.
+include /usr/share/nginx/modules/*.conf;
+
+events {
+    worker_connections 1024;
+}
+
+http {
+
+    log_format main
+        '$remote_addr - $remote_user [$time_local] "$request" '
+        '$status $body_bytes_sent "$http_referer" '
+        '"$http_user_agent" "$http_x_forwarded_for"';
+
+    access_log /var/log/nginx/access.log main;
+
+    sendfile on;
+
+    tcp_nopush on;
+
+    keepalive_timeout 65;
+
+    types_hash_max_size 4096;
+
+    include /etc/nginx/mime.types;
+
+    default_type application/octet-stream;
+
+    # Load application-specific configuration.
+    include /etc/nginx/conf.d/*.conf;
+}
+EOF
+
+cat > /etc/nginx/conf.d/platform.conf <<'EOF'
+server {
+
+    listen 80;
+
+    server_name _;
+
+    access_log /var/log/nginx/platform_access.log;
+
+    error_log /var/log/nginx/platform_error.log;
+
+    location / {
+
+        proxy_pass http://127.0.0.1:8000;
+
+        proxy_http_version 1.1;
+
+        proxy_set_header Host $host;
+
+        proxy_set_header X-Real-IP $remote_addr;
+
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+
+        proxy_set_header X-Forwarded-Proto $scheme;
+
+        proxy_connect_timeout 5s;
+
+        proxy_send_timeout 60s;
+
+        proxy_read_timeout 60s;
+
+    }
+}
+EOF
+
+echo "===== Testing Nginx configuration ====="
+
+nginx -t
+
+systemctl enable nginx
+
+systemctl restart nginx
+
+systemctl is-active nginx
+
+# ============================================================
+# SYSTEMD APPLICATION SERVICE
+# ============================================================
+
+echo "===== Creating systemd application service ====="
+
+cat > /etc/systemd/system/platform.service <<'EOF'
+[Unit]
+Description=Platform Engineer Assignment FastAPI Application
+
+After=network-online.target
+Wants=network-online.target
+
+ConditionPathExists=/etc/platform/platform.env
+ConditionPathExists=/opt/platform/current
+
+[Service]
+
+Type=simple
+
+User=platform
+Group=platform
+
+WorkingDirectory=/opt/platform/current
+
+EnvironmentFile=/etc/platform/platform.env
+
+ExecStart=/opt/platform/current/venv/bin/uvicorn app.main:app --host 127.0.0.1 --port 8000 --workers 2
+
+Restart=always
+
+RestartSec=5
+
+TimeoutStartSec=60
+
+TimeoutStopSec=30
+
+StandardOutput=append:/opt/platform/logs/platform.log
+
+StandardError=append:/opt/platform/logs/platform-error.log
+
+NoNewPrivileges=true
+
+PrivateTmp=true
+
+ProtectSystem=full
+
+ProtectHome=true
+
+[Install]
+
+WantedBy=multi-user.target
+EOF
+
+systemctl daemon-reload
+
+systemctl enable platform.service
+
+# The application is intentionally not started here.
+# It will be started by the deployment process after
+# the first release has been installed.
+
+systemctl stop platform.service || true
+
+# ============================================================
+# LOCAL HEALTH CHECK
+# ============================================================
+
+echo "===== Creating local health-check helper ====="
+
+cat > /opt/platform/bin/health_check.sh <<'EOF'
+#!/bin/bash
+
+set -euo pipefail
+
+curl \
+  --fail \
+  --silent \
+  --show-error \
+  --max-time 10 \
+  http://127.0.0.1:8000/api/health/live
+EOF
+
+chmod 750 /opt/platform/bin/health_check.sh
+
+chown platform:platform /opt/platform/bin/health_check.sh
+
+# ============================================================
+# ROLLBACK HELPER
+# ============================================================
+
+echo "===== Creating rollback helper ====="
+
+cat > /opt/platform/bin/rollback.sh <<'EOF'
+#!/bin/bash
+
+set -euo pipefail
+
+CURRENT_LINK="/opt/platform/current"
+
+RELEASE_DIR="/opt/platform/releases"
+
+CURRENT_RELEASE=""
+
+if [ -L "$CURRENT_LINK" ]; then
+
+    CURRENT_RELEASE="$(readlink "$CURRENT_LINK")"
+
+fi
+
+PREVIOUS_RELEASE=""
+
+for release in $(ls -1dt "$RELEASE_DIR"/* 2>/dev/null || true); do
+
+    if [ "$release" != "$CURRENT_RELEASE" ]; then
+
+        PREVIOUS_RELEASE="$release"
+
+        break
+
+    fi
+
+done
+
+if [ -z "$PREVIOUS_RELEASE" ]; then
+
+    echo "No previous release available."
+
+    exit 1
+
+fi
+
+echo "Rolling back to:"
+echo "$PREVIOUS_RELEASE"
+
+ln -sfn "$PREVIOUS_RELEASE" "$CURRENT_LINK"
+
+systemctl daemon-reload
+
+systemctl restart platform.service
+
+sleep 5
+
+/opt/platform/bin/health_check.sh
+
+echo "Rollback successful."
+
+EOF
+
+chmod 750 /opt/platform/bin/rollback.sh
+
+chown platform:platform /opt/platform/bin/rollback.sh
+
+# ============================================================
+# FINAL VERIFICATION
+# ============================================================
+
+echo "===== Bootstrap verification ====="
+
+echo "--- Nginx ---"
+
+systemctl is-enabled nginx
+
+systemctl is-active nginx
+
+nginx -t
+
+echo "--- Platform service ---"
+
+systemctl is-enabled platform.service
+
+systemctl status platform.service --no-pager || true
+
+echo "--- Application directories ---"
+
+ls -la /opt/platform
+
+echo "--- Platform configuration ---"
+
+ls -la /etc/platform
+
+echo "===== Bootstrap completed ====="
+
+echo "===== Platform EC2 bootstrap finished ====="

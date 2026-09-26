@@ -1,145 +1,117 @@
 #!/usr/bin/env bash
-
 set -Eeuo pipefail
 
-
 APP_NAME="platform"
-
 APP_ROOT="/opt/platform"
-
 RELEASES_DIR="${APP_ROOT}/releases"
-
 CURRENT_LINK="${APP_ROOT}/current"
-
 SOURCE_DIR="${1:-$(pwd)}"
 
 TIMESTAMP="$(date '+%Y%m%d-%H%M%S')"
-
 RELEASE_DIR="${RELEASES_DIR}/${TIMESTAMP}"
 
-
-echo "============================================"
-echo "Platform Application Deployment"
-echo "============================================"
-
-echo "Source: ${SOURCE_DIR}"
-
+echo "========================================"
+echo "Platform deployment"
 echo "Release: ${TIMESTAMP}"
+echo "========================================"
 
+if [[ ! -f "${SOURCE_DIR}/requirements.txt" ]]; then
+    echo "ERROR: requirements.txt not found in ${SOURCE_DIR}"
+    exit 1
+fi
 
-echo ""
-echo "[1/9] Creating release directory..."
+if [[ ! -f "${SOURCE_DIR}/alembic.ini" ]]; then
+    echo "ERROR: alembic.ini not found in ${SOURCE_DIR}"
+    exit 1
+fi
 
+mkdir -p "${RELEASE_DIR}"
 
-sudo mkdir -p \
-    "${RELEASE_DIR}"
+echo "[1/8] Copying application..."
 
-
-echo ""
-echo "[2/9] Copying application..."
-
-
-sudo rsync \
-    -a \
+rsync -a \
     --delete \
     --exclude ".git" \
     --exclude ".github" \
     --exclude ".venv" \
+    --exclude "__pycache__" \
     "${SOURCE_DIR}/" \
     "${RELEASE_DIR}/"
 
+echo "[2/8] Creating Python virtual environment..."
 
-echo ""
-echo "[3/9] Creating Python virtual environment..."
+python3.11 -m venv "${RELEASE_DIR}/venv"
 
+echo "[3/8] Installing Python dependencies..."
 
-sudo python3 -m venv \
-    "${RELEASE_DIR}/venv"
+"${RELEASE_DIR}/venv/bin/pip" install --upgrade pip
+"${RELEASE_DIR}/venv/bin/pip" install -r "${RELEASE_DIR}/requirements.txt"
 
+echo "[4/8] Loading database credentials from Secrets Manager..."
 
-echo ""
-echo "[4/9] Installing Python dependencies..."
+source /etc/platform/platform.env
 
+if [[ -z "${DB_SECRET_ARN:-}" ]]; then
+    echo "ERROR: DB_SECRET_ARN is not configured"
+    exit 1
+fi
 
-sudo "${RELEASE_DIR}/venv/bin/pip" \
-    install \
-    --upgrade pip
+SECRET_JSON="$(aws secretsmanager get-secret-value \
+    --secret-id "${DB_SECRET_ARN}" \
+    --query 'SecretString' \
+    --output text)"
 
+DB_USERNAME="$(echo "${SECRET_JSON}" | jq -r '.username')"
+DB_PASSWORD="$(echo "${SECRET_JSON}" | jq -r '.password')"
+DB_HOST="$(echo "${SECRET_JSON}" | jq -r '.host')"
+DB_PORT="$(echo "${SECRET_JSON}" | jq -r '.port')"
+DB_NAME="$(echo "${SECRET_JSON}" | jq -r '.database')"
 
-sudo "${RELEASE_DIR}/venv/bin/pip" \
-    install \
-    -r "${RELEASE_DIR}/requirements.txt"
+export DATABASE_URL="postgresql+psycopg://${DB_USERNAME}:${DB_PASSWORD}@${DB_HOST}:${DB_PORT}/${DB_NAME}"
 
+echo "[5/8] Running database migrations..."
 
-echo ""
-echo "[5/9] Setting release permissions..."
+sudo -u platform env \
+    DATABASE_URL="${DATABASE_URL}" \
+    bash -c "cd '${RELEASE_DIR}' && '${RELEASE_DIR}/venv/bin/alembic' upgrade head"
 
+echo "[6/8] Setting release ownership..."
 
-sudo chown \
-    -R platform:platform \
-    "${RELEASE_DIR}"
+chown -R platform:platform "${RELEASE_DIR}"
 
+echo "[7/8] Switching current release..."
 
-echo ""
-echo "[6/9] Running database migrations..."
+ln -sfn "${RELEASE_DIR}" "${CURRENT_LINK}"
 
+systemctl daemon-reload
+systemctl restart "${APP_NAME}"
 
-sudo -u platform \
-    bash -c "
-        cd '${RELEASE_DIR}' &&
-        source /etc/platform/platform.env &&
-        '${RELEASE_DIR}/venv/bin/alembic' upgrade head
-    "
-
-
-echo ""
-echo "[7/9] Switching current release..."
-
-
-sudo ln -sfn \
-    "${RELEASE_DIR}" \
-    "${CURRENT_LINK}"
-
-
-echo ""
-echo "[8/9] Restarting application..."
-
-
-sudo systemctl restart \
-    "${APP_NAME}"
-
-
-echo ""
-echo "[9/9] Running health check..."
-
+echo "Waiting for application..."
 
 sleep 5
 
+echo "[8/8] Running health checks..."
 
-if sudo \
-    -u platform \
-    bash -c "
-        curl \
-            --fail \
-            --silent \
-            --show-error \
-            http://127.0.0.1:8000/api/health/live
-    "
-then
+if ! curl --fail --silent --show-error \
+    --max-time 10 \
+    "http://127.0.0.1:8000/api/health/live"; then
 
     echo ""
-    echo "============================================"
-    echo "Deployment successful"
-    echo "Release: ${TIMESTAMP}"
-    echo "============================================"
-
-else
-
-    echo ""
-    echo "============================================"
-    echo "Deployment health check FAILED"
-    echo "============================================"
-
+    echo "ERROR: Liveness check failed."
     exit 1
-
 fi
+
+if ! curl --fail --silent --show-error \
+    --max-time 10 \
+    "http://127.0.0.1:8000/api/health/ready"; then
+
+    echo ""
+    echo "ERROR: Readiness check failed."
+    exit 1
+fi
+
+echo ""
+echo "========================================"
+echo "Deployment successful"
+echo "Release: ${RELEASE_DIR}"
+echo "========================================"
